@@ -350,6 +350,21 @@ export class Store {
   nextPullId = 1;
   seq = 0;
   trialNowMs: number;
+  /**
+   * Monotonic mutation counter: bumped on every object write and every ref
+   * write (see putObject / createRepo / deleteRepo / bumpVersion). The git
+   * pack cache keys on it, so any mutation invalidates every cached pack.
+   * It never enters any API response or state export.
+   */
+  version = 0;
+  /**
+   * Cache of built fetch packs, keyed by the full fetch inputs plus
+   * `version` (see git.ts computeFetch). A cached pack is byte-identical to
+   * a freshly built one for the same inputs, so this is a pure memo: it
+   * cannot change any response, only skip redundant deflate work. Capped so
+   * a long trial cannot grow it without bound (oldest entry evicted first).
+   */
+  packCache = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
 
   constructor() {
     if (VIEWER.login !== 'adaiversen') {
@@ -369,6 +384,11 @@ export class Store {
       }
     }
     this.trialNowMs = parsed;
+  }
+
+  /** Advance the mutation counter (ref writes call this; object writes bump inside putObject). */
+  bumpVersion(): void {
+    this.version += 1;
   }
 
   /** Advance the monotonic counter and return the new value. */
@@ -413,6 +433,7 @@ export class Store {
     };
     this.nextRepoId += 1;
     this.repos.set(repo.fullName, repo);
+    this.bumpVersion();
     return repo;
   }
 
@@ -421,7 +442,9 @@ export class Store {
   }
 
   deleteRepo(owner: string, name: string): boolean {
-    return this.repos.delete(`${owner}/${name}`);
+    const deleted = this.repos.delete(`${owner}/${name}`);
+    if (deleted) this.bumpVersion();
+    return deleted;
   }
 
   listReposByOwner(owner: string): Repo[] {
@@ -441,8 +464,23 @@ export class Store {
 
   putObject(repo: Repo, type: ObjectType, data: Buffer): string {
     const sha = this.hashObject(type, data);
-    if (!repo.objects.has(sha)) repo.objects.set(sha, { type, data });
+    if (!repo.objects.has(sha)) {
+      repo.objects.set(sha, { type, data });
+      this.bumpVersion();
+    }
     return sha;
+  }
+
+  /**
+   * Store an object whose SHA-1 the caller already computed (receive-pack:
+   * readPack hashed every object while resolving the pack). Identical result
+   * to putObject, minus the redundant hash. Only call with a verified sha.
+   */
+  putObjectKnownSha(repo: Repo, type: ObjectType, data: Buffer, sha: string): void {
+    if (!repo.objects.has(sha)) {
+      repo.objects.set(sha, { type, data });
+      this.bumpVersion();
+    }
   }
 
   getObject(repo: Repo, sha: string): GitObject | undefined {
@@ -647,8 +685,29 @@ export class Store {
     return null;
   }
 
+  /**
+   * True when `anc` is reachable from `desc` by following parents. Unlike
+   * ancestors() this stops the moment `anc` is found, so the common
+   * fast-forward case (old tip = direct parent of the new tip) costs one
+   * commit parse instead of a full-history walk.
+   */
   isAncestor(repo: Repo, anc: string, desc: string): boolean {
-    return this.ancestors(repo, desc).has(anc);
+    if (anc === desc) return true;
+    const seen = new Set<string>([desc]);
+    const stack: string[] = [desc];
+    while (stack.length > 0) {
+      const cur = stack.pop() as string;
+      const obj = this.getObject(repo, cur);
+      if (!obj || obj.type !== 'commit') continue;
+      for (const p of this.parseCommit(obj.data).parents) {
+        if (p === anc) return true;
+        if (!seen.has(p)) {
+          seen.add(p);
+          stack.push(p);
+        }
+      }
+    }
+    return false;
   }
 
   isFastForward(repo: Repo, oldSha: string | null, newSha: string): boolean {

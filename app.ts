@@ -36,21 +36,24 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/** The path and query of a request URL, parsed once (never a throw from a request). */
+function urlParts(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
+/** True when the request provably carries no body (no content-length, or 0, and no chunked encoding). */
+function hasNoBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  const encoding = req.headers['transfer-encoding'];
+  if (encoding !== undefined && encoding !== '') return false;
+  if (length === undefined) return true;
+  const n = Number.parseInt(Array.isArray(length) ? length[0] ?? '' : length, 10);
+  return !Number.isFinite(n) || n <= 0;
 }
 
 /** Lower-cased request headers as a plain record. */
@@ -101,7 +104,7 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const reqId = `req-${++reqCounter}`;
-      const path = pathOf(req);
+      const { path, query } = urlParts(req);
       const method = req.method ?? 'GET';
       const headers = headersOf(req);
       const host = headers.host ?? '';
@@ -120,8 +123,11 @@ export function createApp(): Server {
           return;
         }
 
-        const rawBody = await readBody(req);
-        const ctx: ReqCtx = { method, path, query: queryOf(req), headers, body: rawBody, authed: true, reqId };
+        // GETs (and HEADs) never carry a body in this API; skipping the
+        // stream read saves a promise + listener setup per request. A body
+        // is still read whenever the headers say one may be present.
+        const rawBody = hasNoBody(req) ? Buffer.alloc(0) : await readBody(req);
+        const ctx: ReqCtx = { method, path, query, headers, body: rawBody, authed: true, reqId };
 
         // MCP gets the raw body (it must answer -32700 itself on malformed JSON).
         if (path === '/mcp') {

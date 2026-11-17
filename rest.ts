@@ -399,6 +399,9 @@ function handleGitRefs(ctx: ReqCtx, store: Store, repo: Repo): Resp {
   }
   if (repo.refs.has(ref)) return fail(ctx, 422, 'Validation Failed: Reference already exists');
   repo.refs.set(ref, sha.toLowerCase());
+  // No object was written by this call, so no putObject bumped the version:
+  // a moved ref changes what fetches return, so bump explicitly.
+  store.bumpVersion();
   return ok(ctx, 201, { ref, object: { sha: sha.toLowerCase(), type: 'commit' } });
 }
 
